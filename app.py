@@ -294,18 +294,37 @@ def _state_for_reply(body: ReplyBody) -> dict[str, Any]:
     if state is not None:
         return state
 
+    matching_trigger_ids = [
+        trigger_id
+        for (scope, trigger_id), entry in context_store.items()
+        if scope == 'trigger'
+        and trigger_id in body.conversation_id
+        and entry.get('payload', {}).get('merchant_id') == body.merchant_id
+    ]
+    if matching_trigger_ids:
+        trigger_id = matching_trigger_ids[-1]
+        state = next((
+            candidate for candidate in conversation_state.values()
+            if candidate.get('trigger_id') == trigger_id
+        ), None)
+        if state is not None:
+            conversation_state[body.conversation_id] = state
+            return state
+
     candidates = [
         candidate for candidate in conversation_state.values()
         if body.merchant_id and candidate.get('merchant_id') == body.merchant_id
     ]
-    if candidates:
+    if len(candidates) == 1:
         state = candidates[-1]
         conversation_state[body.conversation_id] = state
         return state
 
-    for (scope, _), entry in context_store.items():
+    for (scope, trigger_id), entry in context_store.items():
         trigger = entry.get('payload', {}) if scope == 'trigger' else {}
         if trigger.get('merchant_id') != body.merchant_id:
+            continue
+        if candidates and not any(candidate.get('trigger_id') == trigger_id for candidate in candidates):
             continue
         merchant = context_store.get(('merchant', body.merchant_id), {}).get('payload', {})
         state = {

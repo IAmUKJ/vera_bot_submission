@@ -122,10 +122,10 @@ def test_reply_handles_lets_do_it_and_auto_reply():
     assert 'next' in intent_payload['body'].lower() or 'draft' in intent_payload['body'].lower()
 
 
-def seed_research_conversation(suffix):
-    category_id = f'dentists_{suffix}'
-    merchant_id = f'merchant_{suffix}'
-    trigger_id = f'trigger_{suffix}'
+def seed_research_conversation(suffix, category_id=None, merchant_id=None, trigger_id=None):
+    category_id = category_id or f'dentists_{suffix}'
+    merchant_id = merchant_id or f'merchant_{suffix}'
+    trigger_id = trigger_id or f'trigger_{suffix}'
     category = {
         'slug': category_id,
         'digest': [{
@@ -159,7 +159,7 @@ def seed_research_conversation(suffix):
         result = client.post('/v1/context', json={
             'scope': scope,
             'context_id': context_id,
-            'version': 1,
+            'version': 2,
             'payload': payload,
         })
         assert result.status_code == 200
@@ -182,7 +182,14 @@ def post_merchant_reply(conversation_id, merchant_id, message, turn_number):
 
 
 def test_research_engaged_reply_honors_abstract_and_patient_whatsapp():
-    conversation_id, merchant_id, _ = seed_research_conversation('engaged')
+    conversation_id, merchant_id, _ = seed_research_conversation(
+        'engaged',
+        category_id='dentists_engaged',
+        merchant_id='m_001_drmeera_dentist_delhi',
+        trigger_id='trg_001_research_digest_dentists',
+    )
+
+    assert conversation_id == 'conv_m_001_drmeera_dentist_delhi_trg_001_research_digest_dentists'
 
     response = post_merchant_reply(
         conversation_id,
