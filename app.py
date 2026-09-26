@@ -16,6 +16,9 @@ START_TIME = time.time()
 # In-memory stores: (scope, context_id) -> {version, payload}
 context_store: dict[tuple[str, str], dict[str, Any]] = {}
 conversation_store: dict[str, list[dict[str, Any]]] = defaultdict(list)
+conversation_state: dict[str, dict[str, Any]] = {}
+suppressed_trigger_ids: set[str] = set()
+suppressed_keys: set[str] = set()
 
 
 def utc_now() -> str:
@@ -156,7 +159,7 @@ class ContextBody(BaseModel):
 
 class TickBody(BaseModel):
     now: str
-    available_triggers: list[str] = []
+    available_triggers: list[str] = Field(default_factory=list)
 
 
 class ReplyBody(BaseModel):
@@ -226,7 +229,7 @@ def tick(body: TickBody):
         if not trigger:
             continue
         suppression = trigger.get('suppression_key') or f"{trigger_id}:default"
-        if suppression in seen_suppressions:
+        if suppression in seen_suppressions or suppression in suppressed_keys or trigger_id in suppressed_trigger_ids:
             continue
         seen_suppressions.add(suppression)
 
@@ -241,8 +244,9 @@ def tick(body: TickBody):
             customer = context_store.get(('customer', customer_id), {}).get('payload') if customer_id else None
 
         message = choose_template_and_body(category, merchant, trigger, customer)
-        actions.append({
-            'conversation_id': f"conv_{merchant_id}_{trigger_id}",
+        conversation_id = f"conv_{merchant_id}_{trigger_id}"
+        action = {
+            'conversation_id': conversation_id,
             'merchant_id': merchant_id,
             'customer_id': customer.get('customer_id') if customer else None,
             'send_as': 'merchant_on_behalf' if customer else 'vera',
@@ -253,49 +257,248 @@ def tick(body: TickBody):
             'cta': message['cta'],
             'suppression_key': suppression,
             'rationale': message['rationale'],
+        }
+        actions.append(action)
+        state = conversation_state.setdefault(conversation_id, {
+            'trigger_id': trigger_id,
+            'trigger_kind': trigger.get('kind', 'generic'),
+            'merchant_id': merchant_id,
+            'customer_id': action['customer_id'],
+            'category_slug': merchant.get('category_slug') or merchant.get('category'),
+            'original_bot_message': message['body'],
+            'sent_bot_bodies': [],
+            'auto_reply_count': 0,
+            'suppressed': False,
+            'action_mode': False,
         })
+        state.update({
+            'trigger_id': trigger_id,
+            'trigger_kind': trigger.get('kind', 'generic'),
+            'merchant_id': merchant_id,
+            'customer_id': action['customer_id'],
+            'category_slug': merchant.get('category_slug') or merchant.get('category'),
+            'original_bot_message': message['body'],
+            'suppression_key': suppression,
+            'trigger': trigger,
+            'merchant': merchant,
+        })
+        if message['body'] not in state['sent_bot_bodies']:
+            state['sent_bot_bodies'].append(message['body'])
+        conversation_store[conversation_id].append({'from': 'bot', 'message': message['body']})
 
     return {'actions': actions[:20]}
 
 
+def _state_for_reply(body: ReplyBody) -> dict[str, Any]:
+    state = conversation_state.get(body.conversation_id)
+    if state is not None:
+        return state
+
+    candidates = [
+        candidate for candidate in conversation_state.values()
+        if body.merchant_id and candidate.get('merchant_id') == body.merchant_id
+    ]
+    if candidates:
+        state = candidates[-1]
+        conversation_state[body.conversation_id] = state
+        return state
+
+    for (scope, _), entry in context_store.items():
+        trigger = entry.get('payload', {}) if scope == 'trigger' else {}
+        if trigger.get('merchant_id') != body.merchant_id:
+            continue
+        merchant = context_store.get(('merchant', body.merchant_id), {}).get('payload', {})
+        state = {
+            'trigger_id': trigger.get('id'),
+            'trigger_kind': trigger.get('kind', 'generic'),
+            'merchant_id': body.merchant_id,
+            'customer_id': body.customer_id,
+            'category_slug': merchant.get('category_slug') or trigger.get('payload', {}).get('category'),
+            'original_bot_message': '',
+            'sent_bot_bodies': [],
+            'auto_reply_count': 0,
+            'suppressed': False,
+            'action_mode': False,
+            'suppression_key': trigger.get('suppression_key'),
+            'trigger': trigger,
+            'merchant': merchant,
+        }
+        conversation_state[body.conversation_id] = state
+        return state
+
+    state = {
+        'trigger_id': None,
+        'trigger_kind': 'generic',
+        'merchant_id': body.merchant_id,
+        'customer_id': body.customer_id,
+        'category_slug': None,
+        'original_bot_message': '',
+        'sent_bot_bodies': [],
+        'auto_reply_count': 0,
+        'suppressed': False,
+        'action_mode': False,
+        'suppression_key': None,
+        'trigger': {},
+        'merchant': {},
+    }
+    conversation_state[body.conversation_id] = state
+    return state
+
+
+def _research_reply(state: dict[str, Any], message: str) -> dict[str, str] | None:
+    normalized = normalize_text(message)
+    wants_abstract = 'abstract' in normalized or 'research' in normalized
+    wants_patient_draft = any(term in normalized for term in ('patient whatsapp', 'patient-ed', 'patient ed', 'patient message', 'draft'))
+    if not wants_abstract and not wants_patient_draft:
+        return None
+
+    category = context_store.get(('category', state.get('category_slug')), {}).get('payload', {})
+    trigger = context_store.get(('trigger', state.get('trigger_id')), {}).get('payload', state.get('trigger', {}))
+    item_id = (trigger.get('payload') or {}).get('top_item_id')
+    digest = category.get('digest') or []
+    item = next((entry for entry in digest if entry.get('id') == item_id), None)
+    if item is None:
+        item = next((entry for entry in digest if entry.get('kind') == 'research'), None)
+
+    parts = []
+    if wants_abstract:
+        if item:
+            parts.append(f"Here are the abstract details: {item.get('title', 'the research item')} ({item.get('source', 'source listed in the digest')}).")
+        else:
+            parts.append('I can share the abstract details once the research item is available in the digest context.')
+
+    if wants_patient_draft:
+        if item:
+            patient_segment = item.get('patient_segment', '').replace('_', ' ')
+            audience = f"For {patient_segment}, " if patient_segment else ''
+            summary = item.get('summary', '')
+            if item.get('trial_n'):
+                draft = f"{audience}the research reports lower caries recurrence with a 3-month fluoride varnish recall than a 6-month recall. Ask your dentist which schedule is appropriate for you."
+            elif summary:
+                draft = f"{summary} Please speak with your dentist about what is appropriate for you."
+            else:
+                draft = f"{item.get('title', 'This dental research')} may be worth discussing at your next visit. Please ask your dentist whether it applies to you."
+        else:
+            draft = 'Please ask your dentist whether this research applies to your care.'
+        parts.append(f'Patient WhatsApp draft:\n"{draft}"')
+
+    merchant_name = (state.get('merchant', {}).get('identity') or {}).get('name', 'your practice')
+    parts.append(f"Would you like me to prepare this for {merchant_name} to review, yes or no?")
+    return {
+        'action': 'send',
+        'body': '\n\n'.join(parts),
+        'cta': 'binary_yes_no',
+        'rationale': 'Acknowledges the requested research material and/or patient draft using the stored digest, and asks one binary next-step question.',
+    }
+
+
+def _reply_for_intent(state: dict[str, Any]) -> dict[str, str]:
+    state['action_mode'] = True
+    kind = state.get('trigger_kind')
+    if kind == 'research_digest':
+        body = 'Great. I’ll prepare the patient WhatsApp draft and the research details for your review. Reply CONFIRM to proceed or CANCEL to stop.'
+    elif kind in {'perf_dip', 'competitor_opened', 'seasonal_perf_dip'}:
+        body = 'Great. I’ll prepare the next visibility improvement using the performance context already shared. Reply CONFIRM to review the proposed change or CANCEL to stop.'
+    elif kind == 'recall_due':
+        body = 'Great. I’ll prepare the recall follow-up using the available appointment options. Reply CONFIRM to review it or CANCEL to stop.'
+    else:
+        topic = state.get('trigger_kind', 'original request').replace('_', ' ')
+        body = f"Great. I’ll move ahead with the {topic} next step from our conversation. Reply CONFIRM to review it or CANCEL to stop."
+    return {
+        'action': 'send',
+        'body': body,
+        'cta': 'binary_confirm_cancel',
+        'rationale': 'Merchant explicitly committed; switching to an action-oriented next step grounded in the existing trigger context.',
+    }
+
+
+def _unique_reply(state: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    message = response.get('body')
+    if not message:
+        return response
+    sent_bodies = state.setdefault('sent_bot_bodies', [])
+    while message in sent_bodies:
+        message = f"Quick follow-up: {message}"
+    response['body'] = message
+    sent_bodies.append(message)
+    return response
+
+
 @app.post('/v1/reply')
 def reply(body: ReplyBody):
+    state = _state_for_reply(body)
     history = conversation_store[body.conversation_id]
     history.append({'from': body.from_role, 'message': body.message, 'turn_number': body.turn_number})
 
     msg = body.message or ''
-    if looks_like_auto_reply(msg):
+    if state.get('suppressed'):
+        return {'action': 'end', 'rationale': 'This conversation is already suppressed after an opt-out; no further messages will be sent.'}
+
+    previous_merchant_messages = [entry['message'] for entry in history[:-1] if entry.get('from') == body.from_role]
+    repeated_message = normalize_text(msg) in {normalize_text(previous) for previous in previous_merchant_messages}
+    is_auto_reply = looks_like_auto_reply(msg) or repeated_message
+    if is_auto_reply:
+        state['auto_reply_count'] = state.get('auto_reply_count', 0) + 1
+        count = state['auto_reply_count']
+        if count >= 3:
+            state['suppressed'] = True
+            suppressed_trigger_ids.add(state.get('trigger_id'))
+            if state.get('suppression_key'):
+                suppressed_keys.add(state['suppression_key'])
+            return {'action': 'end', 'rationale': 'Repeated canned or identical replies indicate the owner is unavailable; closing and suppressing this conversation.'}
+        wait_seconds = 14400 if count == 1 else 86400
         return {
             'action': 'wait',
-            'wait_seconds': 14400,
-            'rationale': "Detected merchant auto-reply (canned 'Thank you for contacting' phrasing). Backing off 4 hours to wait for owner."
+            'wait_seconds': wait_seconds,
+            'rationale': 'Detected a likely canned or repeated auto-reply. Backing off before another attempt.',
         }
 
     if looks_like_opt_out(msg):
+        state['suppressed'] = True
+        if state.get('trigger_id'):
+            suppressed_trigger_ids.add(state['trigger_id'])
+        if state.get('suppression_key'):
+            suppressed_keys.add(state['suppression_key'])
         return {
             'action': 'end',
             'rationale': 'Merchant explicitly opted out. Closing conversation; suppressing this conversation_id for future ticks.'
         }
 
-    if intent_transition(msg):
-        return {
+    if state.get('trigger_kind') == 'research_digest':
+        engaged = _research_reply(state, msg)
+        if engaged:
+            response = engaged
+        elif intent_transition(msg):
+            response = _reply_for_intent(state)
+        elif re.search(r'\b(gst|tax filing|accounting|legal advice)\b', normalize_text(msg)):
+            category = context_store.get(('category', state.get('category_slug')), {}).get('payload', {})
+            trigger = context_store.get(('trigger', state.get('trigger_id')), {}).get('payload', state.get('trigger', {}))
+            item_id = (trigger.get('payload') or {}).get('top_item_id')
+            item = next((entry for entry in category.get('digest', []) if entry.get('id') == item_id), None)
+            topic = item.get('source', 'the research item') if item else 'the research item'
+            response = {
+                'action': 'send',
+                'body': f"I’ll leave that to your accountant, as it’s outside what I can help with. Coming back to {topic}: would you like the abstract details or the patient WhatsApp draft?",
+                'cta': 'open_ended',
+                'rationale': 'Politely declines the unrelated request and redirects to the original research conversation.',
+            }
+        else:
+            response = {
+                'action': 'send',
+                'body': 'I’ll keep this on the research item we were discussing. Would you like me to share its abstract details or prepare a patient WhatsApp draft?',
+                'cta': 'open_ended',
+                'rationale': 'Keeps the reply anchored to the original research trigger instead of restarting qualification.',
+            }
+    elif intent_transition(msg):
+        response = _reply_for_intent(state)
+    else:
+        response = {
             'action': 'send',
-            'body': 'Great — I’ll draft the next step immediately. I can prepare the patient WhatsApp and the GBP post in one go. Reply CONFIRM to proceed or STOP to exit.',
-            'cta': 'binary_confirm_cancel',
-            'rationale': 'Merchant explicitly committed; switching from question-asking to action-execution. Concrete next step + clear confirm/stop choice.'
-        }
-
-    if body.from_role == 'merchant' and len(history) >= 2 and 'yes' in normalize_text(msg):
-        return {
-            'action': 'send',
-            'body': 'Perfect — I’ll send the draft now. You can review it and I’ll keep it to the essentials.',
+            'body': 'I’ll keep this focused on the original topic. What would be the most useful next step for you?',
             'cta': 'open_ended',
-            'rationale': 'Honoring the merchant’s positive intent with a minimal next step.'
+            'rationale': 'Continues from the existing conversation context with a focused next step.',
         }
 
-    return {
-        'action': 'send',
-        'body': 'I hear you. I can keep this focused on the specific issue and not waste your time. Tell me the one thing you want to fix first.',
-        'cta': 'open_ended',
-        'rationale': 'Restarting the conversation around a single concrete next step without forcing a broad decision.'
-    }
+    response = _unique_reply(state, response)
+    history.append({'from': 'bot', 'message': response.get('body', '')})
+    return response

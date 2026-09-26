@@ -120,3 +120,142 @@ def test_reply_handles_lets_do_it_and_auto_reply():
     intent_payload = intent_msg.json()
     assert intent_payload['action'] == 'send'
     assert 'next' in intent_payload['body'].lower() or 'draft' in intent_payload['body'].lower()
+
+
+def seed_research_conversation(suffix):
+    category_id = f'dentists_{suffix}'
+    merchant_id = f'merchant_{suffix}'
+    trigger_id = f'trigger_{suffix}'
+    category = {
+        'slug': category_id,
+        'digest': [{
+            'id': f'digest_{suffix}',
+            'kind': 'research',
+            'title': '3-month fluoride varnish recall outperforms 6-month for high-risk adult caries',
+            'source': 'JIDA Oct 2026, p.14',
+            'trial_n': 2100,
+            'patient_segment': 'high_risk_adults',
+            'summary': 'Multi-center Indian trial shows 38% lower caries recurrence with 3-month vs 6-month recall in adults with active decay history.',
+        }],
+    }
+    merchant = {
+        'merchant_id': merchant_id,
+        'category_slug': category_id,
+        'identity': {'name': "Dr. Meera's Dental Clinic"},
+    }
+    trigger = {
+        'id': trigger_id,
+        'kind': 'research_digest',
+        'scope': 'merchant',
+        'merchant_id': merchant_id,
+        'payload': {'category': category_id, 'top_item_id': f'digest_{suffix}'},
+        'suppression_key': f'research:{suffix}',
+    }
+    for scope, context_id, payload in (
+        ('category', category_id, category),
+        ('merchant', merchant_id, merchant),
+        ('trigger', trigger_id, trigger),
+    ):
+        result = client.post('/v1/context', json={
+            'scope': scope,
+            'context_id': context_id,
+            'version': 1,
+            'payload': payload,
+        })
+        assert result.status_code == 200
+
+    result = client.post('/v1/tick', json={'now': '2026-09-26T10:00:00Z', 'available_triggers': [trigger_id]})
+    assert result.status_code == 200
+    return result.json()['actions'][0]['conversation_id'], merchant_id, trigger_id
+
+
+def post_merchant_reply(conversation_id, merchant_id, message, turn_number):
+    return client.post('/v1/reply', json={
+        'conversation_id': conversation_id,
+        'merchant_id': merchant_id,
+        'customer_id': None,
+        'from_role': 'merchant',
+        'message': message,
+        'received_at': '2026-09-26T10:42:00Z',
+        'turn_number': turn_number,
+    })
+
+
+def test_research_engaged_reply_honors_abstract_and_patient_whatsapp():
+    conversation_id, merchant_id, _ = seed_research_conversation('engaged')
+
+    response = post_merchant_reply(
+        conversation_id,
+        merchant_id,
+        'Yes please send the abstract. Also draft the patient WhatsApp.',
+        2,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['action'] == 'send'
+    assert payload['cta'] == 'binary_yes_no'
+    assert 'abstract' in payload['body'].lower()
+    assert 'patient whatsapp draft' in payload['body'].lower()
+    assert 'JIDA Oct 2026, p.14' in payload['body']
+    assert '3-month fluoride varnish recall' in payload['body']
+    assert 'yes or no?' in payload['body'].lower()
+
+
+def test_auto_reply_waits_then_backs_off_and_ends():
+    conversation_id, merchant_id, _ = seed_research_conversation('auto')
+    auto_message = 'Thank you for contacting Dr. Meera. Our team will respond shortly.'
+
+    first = post_merchant_reply(conversation_id, merchant_id, auto_message, 2).json()
+    second = post_merchant_reply(conversation_id, merchant_id, auto_message, 3).json()
+    third = post_merchant_reply(conversation_id, merchant_id, auto_message, 4).json()
+
+    assert first['action'] == 'wait'
+    assert first['wait_seconds'] == 14400
+    assert second['action'] == 'wait'
+    assert second['wait_seconds'] == 86400
+    assert third['action'] == 'end'
+
+
+def test_hard_no_suppresses_trigger_on_future_ticks():
+    conversation_id, merchant_id, trigger_id = seed_research_conversation('optout')
+
+    response = post_merchant_reply(conversation_id, merchant_id, 'Not interested. Stop messaging me.', 2)
+    tick = client.post('/v1/tick', json={'now': '2026-09-26T11:00:00Z', 'available_triggers': [trigger_id]})
+
+    assert response.json()['action'] == 'end'
+    assert tick.status_code == 200
+    assert tick.json()['actions'] == []
+
+
+def test_intent_transition_uses_action_mode_without_qualifying():
+    conversation_id, merchant_id, _ = seed_research_conversation('intent')
+
+    payload = post_merchant_reply(conversation_id, merchant_id, "Let's do it", 2).json()
+
+    assert payload['action'] == 'send'
+    assert payload['cta'] == 'binary_confirm_cancel'
+    assert 'confirm' in payload['body'].lower()
+    assert 'what would be useful' not in payload['body'].lower()
+
+
+def test_gst_curveball_redirects_to_original_research_context():
+    conversation_id, merchant_id, _ = seed_research_conversation('curveball')
+
+    payload = post_merchant_reply(conversation_id, merchant_id, 'Can you also help me with my GST filing?', 2).json()
+
+    assert payload['action'] == 'send'
+    assert 'accountant' in payload['body'].lower()
+    assert 'JIDA Oct 2026, p.14' in payload['body']
+    assert 'abstract' in payload['body'].lower()
+
+
+def test_bot_does_not_repeat_exact_body_in_conversation():
+    conversation_id, merchant_id, _ = seed_research_conversation('repeat')
+
+    first = post_merchant_reply(conversation_id, merchant_id, 'Tell me more about that.', 2).json()
+    second = post_merchant_reply(conversation_id, merchant_id, 'What else should I know?', 3).json()
+
+    assert first['action'] == 'send'
+    assert second['action'] == 'send'
+    assert first['body'] != second['body']
