@@ -209,7 +209,13 @@ def push_context(body: ContextBody):
 
     key = (body.scope, body.context_id)
     current = context_store.get(key)
-    if current is not None and current['version'] >= body.version:
+    if current is not None and current['version'] == body.version:
+        return {
+            'accepted': True,
+            'ack_id': f'ack_{body.context_id}_v{body.version}',
+            'stored_at': utc_now(),
+        }
+    if current is not None and current['version'] > body.version:
         return JSONResponse(
             status_code=409,
             content={'accepted': False, 'reason': 'stale_version', 'current_version': current['version']},

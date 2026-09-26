@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-import os
-
 """
 magicpin AI Challenge — LLM-Powered Judge Simulator
 ====================================================
@@ -17,6 +15,8 @@ That's it!
 
 Author: magicpin AI Challenge Team
 """
+
+import os
 
 # =============================================================================
 # ██████  CONFIGURATION - EDIT THIS SECTION ██████
@@ -359,10 +359,11 @@ class DatasetLoader:
 
     def load(self) -> bool:
         try:
-            cat_dir = self.dataset_dir / "categories"
+            generated_dir = self.dataset_dir / "generated"
+            cat_dir = generated_dir / "categories" if (generated_dir / "categories").exists() else self.dataset_dir / "categories"
             if cat_dir.exists():
                 for f in cat_dir.glob("*.json"):
-                    data = json.load(open(f))
+                    data = json.loads(f.read_text(encoding="utf-8"))
                     self.categories[data.get("slug", f.stem)] = data
 
             for name, container, key in [
@@ -370,14 +371,21 @@ class DatasetLoader:
                 ("customers_seed.json", "customers", "customer_id"),
                 ("triggers_seed.json", "triggers", "id")
             ]:
-                path = self.dataset_dir / name
-                if path.exists():
-                    data = json.load(open(path))
-                    items = data.get(container, data.get(container.rstrip("s"), []))
-                    storage = getattr(self, container)
-                    for item in items:
+                generated_scope = generated_dir / container
+                storage = getattr(self, container)
+                if generated_scope.exists():
+                    for path in generated_scope.glob("*.json"):
+                        item = json.loads(path.read_text(encoding="utf-8"))
                         if key in item:
                             storage[item[key]] = item
+                else:
+                    path = self.dataset_dir / name
+                    if path.exists():
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        items = data.get(container, data.get(container.rstrip("s"), []))
+                        for item in items:
+                            if key in item:
+                                storage[item[key]] = item
             return True
         except Exception as e:
             print_fail(f"Dataset load error: {e}")
@@ -634,21 +642,35 @@ class JudgeSimulator:
 
         data, err, lat = self.client.metadata()
         if err:
-            print_warn(f"metadata: {err}")
-        else:
-            print_success(f"metadata — Team: {data.get('team_name', '?')}, Model: {data.get('model', '?')}")
+            print_fail(f"metadata: {err}")
+            return False
+        print_success(f"metadata — Team: {data.get('team_name', '?')}, Model: {data.get('model', '?')}")
 
         print_section("CONTEXT PUSH")
-        for slug, cat in self.dataset.categories.items():
-            data, err, _ = self.client.push_context("category", slug, 1, cat)
-            status = "PASS" if data and data.get("accepted") else "FAIL"
-            print(f"  [{status}] category/{slug}")
+        scopes = (
+            ("category", self.dataset.categories),
+            ("merchant", self.dataset.merchants),
+            ("customer", self.dataset.customers),
+        )
+        for scope, contexts in scopes:
+            for context_id, payload in contexts.items():
+                data, err, _ = self.client.push_context(scope, context_id, 1, payload)
+                if err or not data or not data.get("accepted"):
+                    print_fail(f"{scope}/{context_id}: {err or data}")
+                    return False
+            print_success(f"{scope}: pushed {len(contexts)} contexts")
 
-        for mid, m in list(self.dataset.merchants.items())[:5]:
-            data, err, _ = self.client.push_context("merchant", mid, 1, m)
-            status = "PASS" if data and data.get("accepted") else "FAIL"
-            short_id = mid.split('_')[1] if '_' in mid else mid[:10]
-            print(f"  [{status}] merchant/{short_id}")
+        data, err, _ = self.client.healthz()
+        expected = {
+            "category": len(self.dataset.categories),
+            "merchant": len(self.dataset.merchants),
+            "customer": len(self.dataset.customers),
+        }
+        actual = (data or {}).get("contexts_loaded", {})
+        if err or any(actual.get(scope) != count for scope, count in expected.items()):
+            print_fail(f"Warmup counts do not match: expected {expected}, got {actual}; error={err}")
+            return False
+        print_success(f"Warmup counts verified: {expected}")
 
         return True
 
@@ -660,7 +682,10 @@ class JudgeSimulator:
 
         trigs = list(self.dataset.triggers.keys())[:3]
         for tid in trigs:
-            self.client.push_context("trigger", tid, 1, self.dataset.triggers[tid])
+            pushed, push_error, _ = self.client.push_context("trigger", tid, 1, self.dataset.triggers[tid])
+            if push_error or not pushed or not pushed.get("accepted"):
+                print_fail(f"trigger/{tid}: {push_error or pushed}")
+                return False
 
         data, err, lat = self.client.tick(trigs)
         if err:
@@ -690,19 +715,20 @@ class JudgeSimulator:
         mid = list(self.dataset.merchants.keys())[0] if self.dataset.merchants else "m_test"
         auto_msg = "Thank you for contacting us! Our team will respond shortly."
 
+        responses = []
         for i in range(1, 5):
             print_info(f"Turn {i}: Sending auto-reply...")
-            data, err, _ = self.client.reply(f"conv_auto_{i}", mid, auto_msg, i + 1)
+            data, err, _ = self.client.reply("conv_auto_replay", mid, auto_msg, i + 1)
 
             if err:
                 print_fail(f"Error: {err}")
                 return False
 
             action = data.get("action", "?")
+            responses.append(data)
 
             if action == "end":
                 print_success(f"Turn {i}: Bot ENDED — detected auto-reply pattern!")
-                return True
             elif action == "wait":
                 wait_s = data.get("wait_seconds", "?")
                 print_success(f"Turn {i}: Bot WAITING {wait_s}s")
@@ -710,8 +736,84 @@ class JudgeSimulator:
                 body = data.get("body", "")[:50]
                 print_warn(f"Turn {i}: Bot sent: \"{body}...\"")
 
-        print_warn("Bot never ended after 4 auto-replies")
+        expected = [("wait", 14400), ("wait", 86400), ("end", None), ("end", None)]
+        actual = [(item.get("action"), item.get("wait_seconds")) for item in responses]
+        if actual != expected:
+            print_fail(f"Auto-reply backoff mismatch: {actual}; expected {expected}")
+            return False
+        print_success("Repeated auto-reply backoff and termination verified")
         return True
+
+    def _start_trigger_conversation(self, trigger_kind: str, excluded: set[str] = None):
+        excluded = excluded or set()
+        match = next((
+            (trigger_id, trigger)
+            for trigger_id, trigger in self.dataset.triggers.items()
+            if trigger.get("kind") == trigger_kind and trigger_id not in excluded
+        ), None)
+        if match is None:
+            raise RuntimeError(f"Dataset has no unused {trigger_kind} trigger")
+
+        trigger_id, trigger = match
+        pushed, err, _ = self.client.push_context("trigger", trigger_id, 1, trigger)
+        if err or not pushed or not pushed.get("accepted"):
+            raise RuntimeError(f"Could not push trigger {trigger_id}: {err or pushed}")
+        tick, err, _ = self.client.tick([trigger_id])
+        if err:
+            raise RuntimeError(f"Tick failed for {trigger_id}: {err}")
+        action = next((item for item in tick.get("actions", []) if item.get("trigger_id") == trigger_id), None)
+        if action is None:
+            raise RuntimeError(f"No action created for trigger {trigger_id}")
+        return action
+
+    def _conversation_replays(self) -> bool:
+        print_section("STATEFUL CONVERSATION REPLAYS")
+        try:
+            research = self._start_trigger_conversation("research_digest")
+            engaged, err, _ = self.client.reply(
+                research["conversation_id"], research["merchant_id"],
+                "Yes please send the abstract. Also draft the patient WhatsApp.", 2
+            )
+            if err or not engaged or engaged.get("action") != "send" or engaged.get("cta") != "binary_yes_no":
+                raise RuntimeError(f"Research engaged reply mismatch: {err or engaged}")
+            if not all(word in engaged.get("body", "").lower() for word in ("abstract", "patient whatsapp")):
+                raise RuntimeError(f"Research reply omitted a requested item: {engaged}")
+            print_success("Engaged research reply acknowledged abstract and patient WhatsApp")
+
+            curveball, err, _ = self.client.reply(
+                research["conversation_id"], research["merchant_id"],
+                "Btw can you also help me with my GST filing this month?", 3
+            )
+            if err or not curveball or curveball.get("action") != "send":
+                raise RuntimeError(f"Curveball reply mismatch: {err or curveball}")
+            if "accountant" not in curveball.get("body", "").lower():
+                raise RuntimeError(f"Curveball was not politely redirected: {curveball}")
+            print_success("GST curveball politely redirected to the research thread")
+
+            hard_no_action = self._start_trigger_conversation("perf_dip")
+            hard_no, err, _ = self.client.reply(
+                hard_no_action["conversation_id"], hard_no_action["merchant_id"],
+                "Not interested. Stop messaging me.", 2
+            )
+            if err or not hard_no or hard_no.get("action") != "end":
+                raise RuntimeError(f"Hard opt-out mismatch: {err or hard_no}")
+            after_opt_out, err, _ = self.client.tick([hard_no_action["trigger_id"]])
+            if err or (after_opt_out or {}).get("actions"):
+                raise RuntimeError(f"Suppressed trigger restarted after opt-out: {err or after_opt_out}")
+            print_success("Hard opt-out ended and suppressed the trigger")
+
+            intent_action = self._start_trigger_conversation("active_planning_intent")
+            intent, err, _ = self.client.reply(
+                intent_action["conversation_id"], intent_action["merchant_id"], "Let's do it", 2
+            )
+            if err or not intent or intent.get("action") != "send" or intent.get("cta") != "binary_confirm_cancel":
+                raise RuntimeError(f"Intent transition mismatch: {err or intent}")
+            print_success("Let's do it switched directly to action mode")
+
+            return self._auto_reply()
+        except Exception as e:
+            print_fail(f"Conversation replay failed: {e}")
+            return False
 
     def _intent(self) -> bool:
         print_section("INTENT TRANSITION")
@@ -785,7 +887,7 @@ class JudgeSimulator:
 
     def _all(self) -> bool:
         results = []
-        for name, fn in [("warmup", self._warmup), ("auto_reply", self._auto_reply),
+        for name, fn in [("test_window", self._phase2_short), ("multi_turn_replays", self._conversation_replays),
                          ("intent", self._intent), ("hostile", self._hostile)]:
             try:
                 results.append((name, fn()))

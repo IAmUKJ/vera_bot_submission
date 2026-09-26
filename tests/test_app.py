@@ -21,7 +21,7 @@ def test_healthz_and_metadata():
         assert key in payload
 
 
-def test_context_is_idempotent_and_replaces_newer_version():
+def test_context_is_idempotent_replaces_newer_and_rejects_older_version():
     payload = {
         'scope': 'category',
         'context_id': 'dentists',
@@ -34,13 +34,17 @@ def test_context_is_idempotent_and_replaces_newer_version():
     assert first.json()['accepted'] is True
 
     second = client.post('/v1/context', json=payload)
-    assert second.status_code == 409
-    assert second.json()['reason'] == 'stale_version'
+    assert second.status_code == 200
+    assert second.json()['accepted'] is True
 
     new_payload = {**payload, 'version': 2, 'payload': {'slug': 'dentists', 'digest': [{'id': 'new'}]}}
     third = client.post('/v1/context', json=new_payload)
     assert third.status_code == 200
     assert third.json()['accepted'] is True
+
+    stale = client.post('/v1/context', json=payload)
+    assert stale.status_code == 409
+    assert stale.json()['reason'] == 'stale_version'
 
 
 def test_tick_creates_action_for_active_trigger():
